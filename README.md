@@ -6,7 +6,7 @@ A full-stack social networking platform built with MongoDB, Express.js, React, a
 
 
 
-## ✨ Features## Features
+## ✨ Features
 
 
 
