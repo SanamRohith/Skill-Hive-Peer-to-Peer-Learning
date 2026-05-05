@@ -1,0 +1,409 @@
+import React, { useState, useEffect } from 'react';
+import { HashRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import axios from 'axios';
+import io from 'socket.io-client';
+import './App.css';
+
+// Components
+import Login from './components/Login';
+import Register from './components/Register';
+import Dashboard from './components/Dashboard';
+import TutorPage from './components/TutorPage';
+import LearnerPage from './components/LearnerPage';
+import Profile from './components/Profile';
+import AdminDashboard from './components/AdminDashboard';
+
+const FALLBACK_BACKEND_URL = process.env.NODE_ENV === 'development'
+  ? 'http://localhost:5000'
+  : 'https://mern-learning-backend.onrender.com';
+const resolveBackendUrl = (value) => {
+  if (process.env.NODE_ENV === 'development') {
+    return 'http://localhost:5000';
+  }
+
+  if (!value || value.includes('your-render-backend-url.onrender.com')) {
+    return FALLBACK_BACKEND_URL;
+  }
+  return value;
+};
+
+const API_BASE_URL = resolveBackendUrl(process.env.REACT_APP_API_URL);
+const SOCKET_URL = resolveBackendUrl(process.env.REACT_APP_SOCKET_URL || API_BASE_URL);
+
+const normalizeSubjectKey = (subject) => String(subject || '').trim().toLowerCase();
+
+// Set up axios defaults
+axios.defaults.baseURL = `${API_BASE_URL}/api`;
+
+function App() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [socket, setSocket] = useState(null);
+  const [notifications, setNotifications] = useState([]);
+  const [showProfile, setShowProfile] = useState(false);
+
+  const handleIncomingNotification = (notification) => {
+    setNotifications((prev) => [notification, ...prev]);
+
+    // Keep tutor verification state in sync as soon as admin action notification arrives.
+    if (notification?.type === 'verification') {
+      const message = String(notification.message || '').toLowerCase();
+
+      if (message.includes('has been verified') || message.includes('congratulations')) {
+        setUser((currentUser) => {
+          if (!currentUser) return currentUser;
+          const updatedUser = {
+            ...currentUser,
+            isVerified: true,
+            verificationStatus: 'approved',
+            certificateRejectionReason: null
+          };
+          localStorage.setItem('user', JSON.stringify(updatedUser));
+          return updatedUser;
+        });
+      } else if (message.includes('was rejected') || message.includes('rejected')) {
+        setUser((currentUser) => {
+          if (!currentUser) return currentUser;
+          const updatedUser = {
+            ...currentUser,
+            isVerified: false,
+            verificationStatus: 'rejected'
+          };
+          localStorage.setItem('user', JSON.stringify(updatedUser));
+          return updatedUser;
+        });
+      }
+    }
+  };
+
+  useEffect(() => {
+    // Check if user is logged in
+    const token = localStorage.getItem('token');
+    if (token) {
+      axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      
+      // Get user data from token (you could also make an API call)
+      try {
+        const userData = JSON.parse(localStorage.getItem('user'));
+        if (userData) {
+          setUser(userData);
+
+          // Refresh user data from server to avoid stale local verification state.
+          axios.get('/user/me')
+            .then((profileResponse) => {
+              const serverUser = profileResponse?.data?.user;
+              if (serverUser) {
+                setUser(serverUser);
+                localStorage.setItem('user', JSON.stringify(serverUser));
+              }
+            })
+            .catch((profileError) => {
+              console.warn('Unable to refresh user profile from server:', profileError?.response?.data || profileError.message);
+            });
+          
+          // Initialize socket connection
+          const newSocket = io(SOCKET_URL);
+          console.log('🔌 Socket connecting to server...');
+          
+          newSocket.on('connect', () => {
+            console.log('✅ Socket connected with ID:', newSocket.id);
+            console.log('📡 Joining room for user ID:', userData.id);
+            newSocket.emit('join', userData.id);
+          });
+          
+          newSocket.on('disconnect', () => {
+            console.log('❌ Socket disconnected');
+          });
+          
+          newSocket.on('connect_error', (error) => {
+            console.error('❌ Socket connection error:', error);
+          });
+          
+          setSocket(newSocket);
+          
+          // Listen for notifications
+          newSocket.on('notification', handleIncomingNotification);
+          
+          // Listen for status updates from server
+          newSocket.on('statusUpdate', (statusData) => {
+            console.log('App.js: Received status update:', statusData);
+            const updatedUser = { ...userData, isOnline: statusData.isOnline };
+            setUser(updatedUser);
+            localStorage.setItem('user', JSON.stringify(updatedUser));
+          });
+          
+          // Listen for rating updates from reviews
+          newSocket.on('ratingUpdated', (ratingUpdate) => {
+            // Update user rating if this is the tutor who received the review
+            setUser(currentUser => {
+              if (currentUser && currentUser.id === ratingUpdate.tutorId) {
+                const updatedUser = { 
+                  ...currentUser, 
+                  rating: ratingUpdate.newRating,
+                  reviewCount: ratingUpdate.newReviewCount,
+                  lastUpdated: Date.now() // Force re-render trigger
+                };
+                
+                // Update localStorage
+                localStorage.setItem('user', JSON.stringify(updatedUser));
+                console.log('✅ Updated rating:', ratingUpdate.newRating, 'reviews:', ratingUpdate.newReviewCount);
+                
+                return updatedUser;
+              }
+              return currentUser;
+            });
+          });
+
+          newSocket.on('certificate:verified', (eventData) => {
+            setUser(currentUser => {
+              if (!currentUser || currentUser.id !== eventData.tutorId) {
+                return currentUser;
+              }
+
+              const currentMap = currentUser.subjectVerifications || {};
+              const subjectKey = normalizeSubjectKey(eventData.subject);
+              const updatedMap = { ...currentMap };
+              if (subjectKey) {
+                updatedMap[subjectKey] = {
+                  ...(updatedMap[subjectKey] || {}),
+                  subject: eventData.subject,
+                  status: 'approved',
+                  rejectionReason: null
+                };
+              }
+
+              const updatedUser = {
+                ...currentUser,
+                isVerified: true,
+                verificationStatus: 'approved',
+                certificateRejectionReason: null,
+                subjectVerifications: updatedMap
+              };
+              localStorage.setItem('user', JSON.stringify(updatedUser));
+              return updatedUser;
+            });
+          });
+
+          newSocket.on('certificate:rejected', (eventData) => {
+            setUser(currentUser => {
+              if (!currentUser || currentUser.id !== eventData.tutorId) {
+                return currentUser;
+              }
+
+              const currentMap = currentUser.subjectVerifications || {};
+              const subjectKey = normalizeSubjectKey(eventData.subject);
+              const updatedMap = { ...currentMap };
+              if (subjectKey) {
+                updatedMap[subjectKey] = {
+                  ...(updatedMap[subjectKey] || {}),
+                  subject: eventData.subject,
+                  status: 'rejected',
+                  rejectionReason: eventData.rejectionReason || null
+                };
+              }
+
+              const updatedUser = {
+                ...currentUser,
+                isVerified: false,
+                verificationStatus: 'rejected',
+                certificateRejectionReason: eventData.rejectionReason || null,
+                subjectVerifications: updatedMap
+              };
+              localStorage.setItem('user', JSON.stringify(updatedUser));
+              return updatedUser;
+            });
+          });
+          
+          // Update user online status when socket connects
+          newSocket.on('connect', () => {
+            console.log('App.js: Socket connected, setting user online');
+            const updatedUser = { ...userData, isOnline: true };
+            setUser(updatedUser);
+            localStorage.setItem('user', JSON.stringify(updatedUser));
+          });
+        }
+      } catch (error) {
+        console.error('Error parsing user data:', error);
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+      }
+    }
+    setLoading(false);
+  }, []);
+
+  const login = (userData, token) => {
+    localStorage.setItem('token', token);
+    localStorage.setItem('user', JSON.stringify(userData));
+    axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+    setUser(userData);
+    
+    // Initialize socket connection
+    const newSocket = io(SOCKET_URL);
+    console.log('🔌 Socket connecting to server (login)...');
+    
+    newSocket.on('connect', () => {
+      console.log('✅ Socket connected with ID:', newSocket.id);
+      console.log('📡 Joining room for user ID:', userData.id);
+      newSocket.emit('join', userData.id);
+      
+      const updatedUser = { ...userData, isOnline: true };
+      setUser(updatedUser);
+      localStorage.setItem('user', JSON.stringify(updatedUser));
+    });
+    
+    newSocket.on('disconnect', () => {
+      console.log('❌ Socket disconnected');
+    });
+    
+    newSocket.on('connect_error', (error) => {
+      console.error('❌ Socket connection error:', error);
+    });
+    
+    setSocket(newSocket);
+    
+    // Listen for notifications
+    newSocket.on('notification', handleIncomingNotification);
+  };
+
+  const logout = async () => {
+    try {
+      // Call logout endpoint to set user offline
+      await axios.post('/logout');
+    } catch (error) {
+      console.error('Error during logout:', error);
+      // Continue with logout even if API call fails
+    }
+    
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    delete axios.defaults.headers.common['Authorization'];
+    setUser(null);
+    if (socket) {
+      socket.disconnect();
+      setSocket(null);
+    }
+    setNotifications([]);
+  };
+
+  const updateUser = (updatedUserOrFn) => {
+    setUser((currentUser) => {
+      const nextUser = typeof updatedUserOrFn === 'function'
+        ? updatedUserOrFn(currentUser)
+        : updatedUserOrFn;
+
+      if (nextUser) {
+        localStorage.setItem('user', JSON.stringify(nextUser));
+      }
+
+      return nextUser;
+    });
+  };
+
+  if (loading) {
+    return (
+      <div className="loading">
+        <div className="spinner"></div>
+        <p>Loading...</p>
+      </div>
+    );
+  }
+
+  return (
+    <Router>
+      <div className="App">
+        {user && (
+          <div className="navbar">
+            <div className="nav-content">
+              <h1>Peer Learning Platform</h1>
+              <div className="nav-right">
+                <span>Welcome, {user.name}</span>
+                <button 
+                  onClick={() => setShowProfile(true)} 
+                  className="profile-btn"
+                  title="View Profile"
+                >
+                  👤 Profile
+                </button>
+                <button onClick={logout} className="logout-btn">Logout</button>
+              </div>
+            </div>
+          </div>
+        )}
+        
+        <Routes>
+          <Route
+            path="/"
+            element={
+              user ? <Navigate to="/dashboard" /> : <Navigate to="/login" />
+            }
+          />
+          <Route
+            path="/login"
+            element={
+              user ? <Navigate to="/dashboard" /> : <Login onLogin={login} />
+            }
+          />
+          <Route
+            path="/register"
+            element={
+              user ? <Navigate to="/dashboard" /> : <Register />
+            }
+          />
+          <Route
+            path="/dashboard"
+            element={
+              user ? <Dashboard user={user} updateUser={updateUser} /> : <Navigate to="/login" />
+            }
+          />
+          <Route
+            path="/tutor"
+            element={
+              user ? (
+                <TutorPage 
+                  key={`${user.id}-${user.rating}-${user.reviewCount}-${user.lastUpdated || 0}`}
+                  user={user} 
+                  updateUser={updateUser} 
+                  notifications={notifications} 
+                  setNotifications={setNotifications}
+                  socket={socket}
+                />
+              ) : <Navigate to="/login" />
+            }
+          />
+          <Route
+            path="/learner"
+            element={
+              user ? (
+                <LearnerPage 
+                  user={user} 
+                  notifications={notifications} 
+                  setNotifications={setNotifications}
+                  socket={socket}
+                />
+              ) : <Navigate to="/login" />
+            }
+          />
+          <Route
+            path="/admin"
+            element={
+              user && user.role === 'admin' ? (
+                <AdminDashboard user={user} />
+              ) : <Navigate to="/login" />
+            }
+          />
+        </Routes>
+        
+        {/* Profile Modal */}
+        {showProfile && user && (
+          <Profile 
+            user={user}
+            updateUser={updateUser}
+            onClose={() => setShowProfile(false)}
+          />
+        )}
+      </div>
+    </Router>
+  );
+}
+
+export default App;
