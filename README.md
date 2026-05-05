@@ -415,4 +415,24 @@ This project is licensed under the MIT License.
 
 ---
 
+## 📸 Screenshots
+
+### 🔐 Login Page
+![Login](screenshots/login.png)
+
+### 📝 Signup Page
+![Signup](screenshots/signup.png)
+
+### 🧑‍🎓 User Dashboard
+![User](screenshots/user.png)
+
+### 👨‍🏫 Tutor Dashboard
+![Tutor](screenshots/tutor.png)
+
+### 🛠 Admin Dashboard
+![Admin](screenshots/admin.png)
+
+### 📚 Learner Page
+![Learner](screenshots/learner.png)
+
 **Happy Learning! 🎓📚**
